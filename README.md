@@ -29,6 +29,24 @@ UPDATE_ALL: Z-Mod updated.
 UPDATE_ALL: Done. Updated 4: fluidd, ff_nfc, moon, Z-Mod.
 ```
 
+## The Update all button
+
+Mainsail's **UPDATE ALL COMPONENTS** and Fluidd's update-all button go
+through the same queue. The plugin's Moonraker component
+(`moonraker/zmod_update_all.py`) points Moonraker's full-update request
+(`machine.update.full`, and `machine.update.upgrade` without a name) at
+`update_all.py`. Stock Moonraker would run every updater in a row: it
+tries the OS packages, stops at the first repo with local changes, and is
+cut off when Zmod reboots after Z-Mod. With the plugin, the button skips
+System/OS packages and broken repos, updates plugins first, and resumes
+after each reboot, exactly like `UPDATE_ALL`. Progress shows in the update
+dialog and in the console.
+
+No Zmod file is changed. `install.sh` (run by `ENABLE_PLUGIN`) links the
+component into Moonraker's components, includes
+`zmod_update_all.moonraker.conf` from `mod_data/plugins.moonraker.conf` and
+reboots once. `DISABLE_PLUGIN` removes both, and the button is stock again.
+
 ## How many reboots
 
 Zmod's Moonraker reboots the printer by itself straight after it updates

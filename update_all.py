@@ -80,9 +80,16 @@ def request(method, path, query=None, body=None, timeout=30):
         raise RuntimeError(msg) from None
 
 
-def say(text):
-    """Log a line and show it in the Klipper console."""
+def say(text, complete=False):
+    """Log a line and show it in the Klipper console and, when the
+    zmod_update_all Moonraker component is loaded, in the web UI's update
+    dialog (complete=True lets that dialog close)."""
     log(text)
+    try:
+        request("POST", "/server/zmod_update_all/message",
+                body={"msg": text, "complete": complete}, timeout=10)
+    except Exception:
+        pass  # component not loaded (yet): console only
     # Klipper drops everything after ';' and the value cannot hold quotes.
     clean = text.replace('"', "'").replace(";", ",").replace("\n", " ")
     try:
@@ -215,16 +222,16 @@ def finish(q, reboot):
         summary += ": " + ", ".join(done)
     if failed:
         summary += ". Failed: " + ", ".join(failed)
-    say(summary + ".")
+    say(summary + ".", complete=not q["need_reboot"])
     if not q["need_reboot"]:
         return
     if not reboot:
-        say("Reboot skipped (REBOOT=0). Reboot to load the new versions.")
+        say("Reboot skipped (REBOOT=0). Reboot to load the new versions.", complete=True)
         return
-    say("Rebooting in 10 seconds to load the new versions.")
+    say("Rebooting in 10 seconds to load the new versions.", complete=True)
     time.sleep(10)
     if is_printing():
-        say("A print started, not rebooting.")
+        say("A print started, not rebooting.", complete=True)
         return
     request("POST", "/printer/gcode/script", body={"script": "REBOOT"},
             timeout=60)
@@ -232,10 +239,10 @@ def finish(q, reboot):
 
 def start(check, reboot):
     if is_printing():
-        say("Refused: the printer is printing.")
+        say("Refused: the printer is printing.", complete=True)
         return
     if request("GET", "/machine/update/status").get("busy"):
-        say("Refused: Moonraker is already updating something.")
+        say("Refused: Moonraker is already updating something.", complete=True)
         return
     if load_queue():
         say("Dropping an unfinished queue from an earlier run.")
@@ -249,7 +256,7 @@ def start(check, reboot):
         say(f"Skipping {describe(name, info[name])}: {reason}.")
     if not todo:
         say("Everything is up to date." if not skipped else
-            "Nothing else to update.")
+            "Nothing else to update.", complete=True)
         return
     say(f"{len(todo)} update(s): " +
         ", ".join(describe(n, info[n]) for n in todo))
@@ -258,13 +265,14 @@ def start(check, reboot):
         say(f"{', '.join(core)} each reboot the printer by themselves. "
             f"The queue carries on after each reboot.")
     if check:
-        say("Check only. Run UPDATE_ALL to install them.")
+        say("Check only. Run UPDATE_ALL to install them.", complete=True)
         return
     if core and not reboot:
         say(f"REBOOT=0: leaving out {', '.join(core)}, "
             "Zmod reboots after updating them.")
         todo = [n for n in todo if not reboots(n)]
         if not todo:
+            say("Nothing left to update.", complete=True)
             return
 
     q = {"started": time.time(), "reboot": reboot, "done": [],
@@ -279,19 +287,19 @@ def resume():
     q["resumes"] = q.get("resumes", 0) + 1
     if q["resumes"] > MAX_RESUMES:
         drop_queue()
-        say("Queue dropped after too many reboots. Run UPDATE_ALL again.")
+        say("Queue dropped after too many reboots. Run UPDATE_ALL again.", complete=True)
         return
     save_queue(q)
     if not wait_ready():
         say("Moonraker or Klipper did not come up, queue stopped. "
-            "Run UPDATE_ALL again.")
+            "Run UPDATE_ALL again.", complete=True)
         drop_queue()
         return
     # We just rebooted, so everything updated so far is loaded.
     q["need_reboot"] = False
     if not refresh(retry_for=600):
         say("Could not check for updates after the reboot, queue stopped. "
-            "Run UPDATE_ALL again.")
+            "Run UPDATE_ALL again.", complete=True)
         drop_queue()
         return
     info = status()
@@ -306,7 +314,7 @@ def resume():
             say(f"{name} is still not up to date, leaving it out.")
     if is_printing():
         drop_queue()
-        say("A print is running, queue stopped. Run UPDATE_ALL later.")
+        say("A print is running, queue stopped. Run UPDATE_ALL later.", complete=True)
         return
     todo, _ = plan(info, exclude=q["done"] + q["failed"])
     if not q["reboot"]:
@@ -328,7 +336,7 @@ def work(q, todo):
             q["attempted"] = name
             save_queue(q)
             say(f"Updating {name}. The printer reboots afterwards and "
-                "UPDATE_ALL carries on by itself.")
+                "UPDATE_ALL carries on by itself.", complete=True)
             try:
                 request("POST", "/machine/update/upgrade", {"name": name},
                         timeout=1800)
@@ -436,7 +444,7 @@ def main():
             start(args.check, not args.no_reboot)
     except Exception as e:
         log(traceback.format_exc())
-        say(f"Stopped by an error: {e}")
+        say(f"Stopped by an error: {e}", complete=True)
         drop_queue()
     finally:
         if not args.foreground:
