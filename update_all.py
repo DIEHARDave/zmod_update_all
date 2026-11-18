@@ -26,12 +26,14 @@ import urllib.parse
 import urllib.request
 
 MOONRAKER = "http://127.0.0.1:7125"
-LOG_PATH = "/tmp/zmod_update_all.log"
+# mod_data/log: kept across reboots and visible in Fluidd/Mainsail.
+LOG_PATH = "/root/printer_data/config/mod_data/log/zmod_update_all.log"
 LOCK_PATH = "/tmp/zmod_update_all.pid"
 # Kept across reboots (the chroot lives on /usr/data).
 QUEUE_PATH = "/root/.zmod_update_all.json"
-# A saved queue older than this is dropped instead of resumed.
-QUEUE_MAX_AGE = 3600
+# A queue is resumed at most this many times. (No age limit: the printer
+# boots with its clock at 2026-01-01 until NTP has synced.)
+MAX_RESUMES = 6
 
 # Zmod's Moonraker (git_deploy.py) runs "systemctl reboot" after updating any
 # of these, so each one ends the boot. Updated last, in this order.
@@ -159,11 +161,21 @@ def status():
     return request("GET", "/machine/update/status")["version_info"]
 
 
-def refresh():
-    try:
-        request("POST", "/machine/update/refresh", timeout=600)
-    except Exception as e:
-        say(f"Refresh failed ({e}), using the last known versions.")
+def refresh(retry_for=0):
+    """Refresh every updater. Right after a boot Moonraker is busy with its
+    own startup refresh and every version reads '?' until one succeeds, so
+    keep retrying for up to retry_for seconds."""
+    end = time.time() + retry_for
+    while True:
+        try:
+            request("POST", "/machine/update/refresh", timeout=600)
+            return True
+        except Exception as e:
+            if time.time() > end:
+                say(f"Refresh failed ({e}), using the last known versions.")
+                return False
+            log(f"Refresh not possible yet ({e}), retrying.")
+            time.sleep(10)
 
 
 # ---- the queue file ---------------------------------------------------
@@ -230,7 +242,7 @@ def start(check, reboot):
         drop_queue()
 
     say("Checking for updates...")
-    refresh()
+    refresh(retry_for=120)
     info = status()
     todo, skipped = plan(info)
     for name, reason in skipped:
@@ -264,10 +276,12 @@ def resume():
     q = load_queue()
     if not q:
         return
-    if time.time() - q.get("started", 0) > QUEUE_MAX_AGE:
+    q["resumes"] = q.get("resumes", 0) + 1
+    if q["resumes"] > MAX_RESUMES:
         drop_queue()
-        log("Dropped an expired queue.")
+        say("Queue dropped after too many reboots. Run UPDATE_ALL again.")
         return
+    save_queue(q)
     if not wait_ready():
         say("Moonraker or Klipper did not come up, queue stopped. "
             "Run UPDATE_ALL again.")
@@ -275,7 +289,11 @@ def resume():
         return
     # We just rebooted, so everything updated so far is loaded.
     q["need_reboot"] = False
-    refresh()
+    if not refresh(retry_for=600):
+        say("Could not check for updates after the reboot, queue stopped. "
+            "Run UPDATE_ALL again.")
+        drop_queue()
+        return
     info = status()
     name = q.get("attempted")
     if name:

@@ -60,14 +60,15 @@ You start it once; the reboots and the resume after each are automatic.
 6. Keeps going if one item fails, and lists the failures at the end. An item
    that is still out of date after its reboot is not tried again, so a bad
    update cannot cause a reboot loop.
-7. Stops if a print starts. A saved queue older than an hour is dropped
-   instead of resumed.
+7. Stops if a print starts. After a reboot it waits until Moonraker's own
+   startup refresh is done before checking versions. A queue is resumed
+   at most 6 times, then dropped.
 8. Reboots once with Zmod's `REBOOT` macro at the end, only if something was
    updated since the last reboot.
 
 The work runs in the background inside Zmod's chroot, so Klipper stays
-responsive. Full log: `/tmp/zmod_update_all.log` in the chroot
-(`/usr/data/.mod/.zmod/tmp/zmod_update_all.log` on the host).
+responsive. Full log: `mod_data/log/zmod_update_all.log` in the printer's config
+folder (Fluidd/Mainsail show it), kept across the reboots.
 
 ## Install
 
