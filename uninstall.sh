@@ -43,5 +43,7 @@ if [ -n "$MOON_DIR" ]; then
     [ -f "$EXCLUDE" ] && sed -i "\|^/components/$COMP\.py\$|d" "$EXCLUDE"
 fi
 
+python3 "$CHROOT_PLUGIN_DIR/update_all.py" --uninject || true
+
 echo "$NAME uninstalled"
 echo "REBOOT" >/tmp/printer

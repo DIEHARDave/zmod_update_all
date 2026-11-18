@@ -16,7 +16,10 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import argparse
+import hashlib
 import json
+import re
+import shutil
 import os
 import sys
 import time
@@ -34,6 +37,13 @@ QUEUE_PATH = "/root/.zmod_update_all.json"
 # A queue is resumed at most this many times. (No age limit: the printer
 # boots with its clock at 2026-01-01 until NTP has synced.)
 MAX_RESUMES = 6
+
+# The web UIs whose "Update all" button Zmod's forks removed. The plugin
+# puts its own back by adding web/zmod_update_all.js to their index.html.
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+WEB_JS = os.path.join(PLUGIN_DIR, "web", "zmod_update_all.js")
+WEB_DIRS = {"mainsail": "/root/mainsail", "fluidd": "/root/fluidd"}
+WEB_MARK = "<!-- zmod_update_all -->"
 
 # Zmod's Moonraker (git_deploy.py) runs "systemctl reboot" after updating any
 # of these, so each one ends the boot. Updated last, in this order.
@@ -183,6 +193,78 @@ def refresh(retry_for=0):
                 return False
             log(f"Refresh not possible yet ({e}), retrying.")
             time.sleep(10)
+
+
+# ---- the web UI button ------------------------------------------------
+
+def _write(path, text):
+    tmp = path + ".zua.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def inject_web(remove=False):
+    """Add (or remove) the Update all button script in Mainsail's and
+    Fluidd's index.html. The web updater replaces those folders, so this
+    runs again after their updates and at every boot. Quiet and safe to
+    repeat. Both are PWAs: the service worker serves a cached index.html,
+    so its precache revision for index.html is changed with it."""
+    try:
+        with open(WEB_JS, "rb") as f:
+            js = f.read()
+    except OSError:
+        return
+    ver = hashlib.md5(js).hexdigest()[:10]
+    tag = (f'{WEB_MARK}<script src="/zmod_update_all.js?v={ver}" defer>'
+           '</script>')
+    for name, d in WEB_DIRS.items():
+        index = os.path.join(d, "index.html")
+        try:
+            with open(index, encoding="utf-8", newline="") as f:
+                html = f.read()
+        except OSError:
+            continue
+        new = re.sub(re.escape(WEB_MARK) + r"[^\n]*?</script>", "", html)
+        if not remove:
+            new = new.replace("</head>", tag + "</head>", 1)
+        dest = os.path.join(d, "zmod_update_all.js")
+        try:
+            if remove:
+                if os.path.exists(dest):
+                    os.remove(dest)
+            else:
+                old = None
+                try:
+                    with open(dest, "rb") as f:
+                        old = f.read()
+                except OSError:
+                    pass
+                if old != js:
+                    shutil.copyfile(WEB_JS, dest)
+            if new == html:
+                continue
+            _write(index, new)
+            sw = os.path.join(d, "sw.js")
+            try:
+                with open(sw, encoding="utf-8", newline="") as f:
+                    swt = f.read()
+            except OSError:
+                swt = None
+            if swt:
+                rev = hashlib.md5(new.encode()).hexdigest()
+                # Mainsail: {url:"index.html",revision:"..."}
+                # Fluidd: {"revision":"...","url":"index.html"}
+                swn = re.sub(r'(\{url:"index\.html",revision:")[0-9a-f]*(")',
+                             lambda m: m.group(1) + rev + m.group(2), swt)
+                swn = re.sub(r'(\{"revision":")[0-9a-f]*(","url":"index\.html")',
+                             lambda m: m.group(1) + rev + m.group(2), swn)
+                if swn != swt:
+                    _write(sw, swn)
+            log(f"{'Removed' if remove else 'Added'} the Update all button "
+                f"in {name}.")
+        except OSError as e:
+            log(f"Could not patch {name}: {e}")
 
 
 # ---- the queue file ---------------------------------------------------
@@ -372,6 +454,8 @@ def work(q, todo):
         else:
             q["done"].append(name)
             q["need_reboot"] = True
+            if name.lower() in WEB_DIRS:
+                inject_web()
         save_queue(q)
     finish(q, q["reboot"])
 
@@ -418,6 +502,10 @@ def main():
                         help="carry on with a saved queue (run at boot)")
     parser.add_argument("--cancel", action="store_true",
                         help="drop a saved queue")
+    parser.add_argument("--inject", action="store_true",
+                        help="add the Update all button to Mainsail/Fluidd")
+    parser.add_argument("--uninject", action="store_true",
+                        help="remove the Update all button again")
     parser.add_argument("--foreground", action="store_true",
                         help="run in this process (for testing over SSH)")
     args = parser.parse_args()
@@ -427,8 +515,14 @@ def main():
         drop_queue()
         print("UPDATE_ALL queue dropped." if had else "No queue to drop.")
         return
-    if args.resume and load_queue() is None:
-        return  # the usual boot: nothing queued, stay quiet
+    if args.inject or args.uninject:
+        inject_web(remove=args.uninject)
+        return
+    if args.resume:
+        # Every boot: put the button back if a web UI update removed it.
+        inject_web()
+        if load_queue() is None:
+            return  # the usual boot: nothing queued, stay quiet
     if already_running():
         print("UPDATE_ALL is already running, see " + LOG_PATH)
         return

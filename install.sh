@@ -68,5 +68,8 @@ FILE="$CONFIG_DIR/mod_data/plugins.moonraker.conf"
 touch "$FILE"
 grep -qF "$INC" "$FILE" || echo "$INC" >>"$FILE"
 
+# Put the Update all button back into Mainsail and Fluidd
+python3 "$CHROOT_PLUGIN_DIR/update_all.py" --inject || true
+
 echo "$NAME installed; Update all in Mainsail/Fluidd uses the update queue after the reboot"
 [ -n "${ZMOD_UPDATE_ALL_NO_REBOOT:-}" ] || echo "REBOOT" >/tmp/printer

@@ -16,12 +16,18 @@
 # the callback of the cached API definition, which both the HTTP route and
 # the websocket method use.
 #
+# Zmod's Mainsail and Fluidd forks have no Update all button any more;
+# update_all.py --inject adds one (web/zmod_update_all.js). A web UI update
+# replaces those files, so the mainsail/fluidd updaters are wrapped here to
+# put the button back right after each of their updates.
+#
 # It also adds POST /server/zmod_update_all/message, which update_all.py
 # uses to show its progress in the web UI's update dialog.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess
@@ -32,6 +38,7 @@ PLUGIN_DIR = "/root/printer_data/config/mod_data/plugins/zmod_update_all"
 SCRIPT = os.path.join(PLUGIN_DIR, "update_all.py")
 PYTHON = "/usr/bin/python3"
 FULL_ENDPOINTS = ("/machine/update/full",)
+WEB_UPDATERS = ("mainsail", "fluidd")
 
 
 class ZmodUpdateAll:
@@ -66,11 +73,39 @@ class ZmodUpdateAll:
         self.um = um
         self.request_type = rtype
         self.hooked = True
+        for name in WEB_UPDATERS:
+            updater = um.get_updaters().get(name)
+            if updater is not None:
+                updater.update = self._wrap_web_update(updater.update)
         self.server.register_endpoint(
             "/server/zmod_update_all/message", rtype.POST,
             self._handle_message)
         logging.info("zmod_update_all: full update routed to update_all.py "
                      f"({', '.join(swapped) or 'upgrade only'})")
+
+    def _wrap_web_update(self, orig: Any) -> Any:
+        async def update(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await orig(*args, **kwargs)
+            finally:
+                await self._inject()
+        return update
+
+    async def _inject(self) -> None:
+        python = PYTHON if os.path.exists(PYTHON) else sys.executable
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                python, SCRIPT, "--inject", env=self._env(),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(proc.wait(), 30)
+        except Exception as e:
+            logging.info(f"zmod_update_all: re-adding the button failed: {e}")
+
+    @staticmethod
+    def _env() -> dict:
+        return {k: v for k, v in os.environ.items()
+                if k not in ("LD_PRELOAD", "LD_LIBRARY_PATH")}
 
     async def _handle_full(self, web_request: Any) -> str:
         if self.um.kconn.is_printing():
@@ -78,8 +113,7 @@ class ZmodUpdateAll:
         if self.um.cmd_helper.is_update_busy():
             raise self.server.error("An update is already running", 503)
         self.send("Starting UPDATE_ALL. Progress also shows in the console.")
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("LD_PRELOAD", "LD_LIBRARY_PATH")}
+        env = self._env()
         python = PYTHON if os.path.exists(PYTHON) else sys.executable
         try:
             # update_all.py forks into the background by itself; its own
