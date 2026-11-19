@@ -1,5 +1,12 @@
 # zmod_update_all
 
+> [!WARNING]
+> **!!EXPERIMENTAL!! Use caution!** This plugin updates Z-Mod, Klipper,
+> Moonraker and every plugin, and reboots the printer on its own, possibly
+> more than once. It has only been tested on a few printers. Never run it
+> while printing, keep a backup of your config, and be ready to power-cycle
+> the printer if it does not come back.
+
 An update queue for **Zmod** printers (Flashforge AD5X, Creator 5, AD5M).
 One macro installs every available update and reboots as few times as
 possible. You no longer click Update on each item and reboot after every one.
