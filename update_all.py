@@ -369,9 +369,8 @@ def start(check, reboot):
         ", ".join(describe(n, info[n]) for n in todo))
     core = [n for n in todo if reboots(n)]
     if core:
-        say(f"{', '.join(core)} can reboot the printer by themselves, so "
-            "they go last, one at a time. The queue carries on after each "
-            "reboot.")
+        say(f"May reboot the printer: {', '.join(core)}. These go last, "
+            "one at a time, and the queue carries on after each reboot.")
     if check:
         say("Check only. Run UPDATE_ALL to install them.", complete=True)
         return
