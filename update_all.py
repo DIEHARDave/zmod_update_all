@@ -148,8 +148,32 @@ def problem(info):
     return None
 
 
+PLUGINS_DIR = "/root/printer_data/config/mod_data/plugins"
+# A plugin's update.sh that asks Zmod for a reboot, e.g. recommend's
+# `echo "REBOOT" >/tmp/printer`. Zmod acts on it seconds later, which
+# would cut into whatever the queue starts next.
+REBOOT_RE = re.compile(rb"""REBOOT["']?\s*>+\s*/tmp/printer|^\s*(sudo\s+)?reboot\b"""
+                       rb"|systemctl\s+reboot", re.M)
+
+
+def plugin_reboots(name):
+    try:
+        with open(os.path.join(PLUGINS_DIR, name, "update.sh"), "rb") as f:
+            return bool(REBOOT_RE.search(f.read()))
+    except OSError:
+        return False
+
+
 def reboots(name):
-    return name.lower() in REBOOTS
+    """True when updating this item may reboot the printer."""
+    return name.lower() in REBOOTS or plugin_reboots(name)
+
+
+def order_key(name):
+    core = {n: i for i, n in enumerate(REBOOTS)}
+    if name.lower() in core:
+        return core[name.lower()]
+    return -1 if plugin_reboots(name) else -2
 
 
 def plan(version_info, exclude=()):
@@ -165,8 +189,9 @@ def plan(version_info, exclude=()):
             skipped.append((name, reason))
         else:
             todo.append(name)
-    order = {n: i for i, n in enumerate(REBOOTS)}
-    todo.sort(key=lambda n: order.get(n.lower(), -1))
+    # Plain plugins first, then plugins whose update.sh may reboot, then
+    # klippy, moon, Z-Mod.
+    todo.sort(key=order_key)
     return todo, skipped
 
 
@@ -343,22 +368,24 @@ def start(check, reboot):
     say(f"{len(todo)} update(s): " +
         ", ".join(describe(n, info[n]) for n in todo))
     core = [n for n in todo if reboots(n)]
-    if core and len(core) > 1:
-        say(f"{', '.join(core)} each reboot the printer by themselves. "
-            f"The queue carries on after each reboot.")
+    if core:
+        say(f"{', '.join(core)} can reboot the printer by themselves, so "
+            "they go last, one at a time. The queue carries on after each "
+            "reboot.")
     if check:
         say("Check only. Run UPDATE_ALL to install them.", complete=True)
         return
     if core and not reboot:
         say(f"REBOOT=0: leaving out {', '.join(core)}, "
-            "Zmod reboots after updating them.")
+            "they can reboot the printer.")
         todo = [n for n in todo if not reboots(n)]
         if not todo:
             say("Nothing left to update.", complete=True)
             return
 
     q = {"started": time.time(), "reboot": reboot, "done": [],
-         "failed": [], "attempted": None, "need_reboot": False}
+         "failed": [], "attempted": None, "attempts": {},
+         "need_reboot": False}
     work(q, todo)
 
 
@@ -388,9 +415,14 @@ def resume():
     name = q.get("attempted")
     if name:
         q["attempted"] = None
+        tries = q.setdefault("attempts", {}).get(name, 1)
         if name in info and not has_update(info[name]):
             q["done"].append(name)
             say(f"{name} updated.")
+        elif tries < 2:
+            # The reboot may have come from something else (a plugin's
+            # update.sh) before this update even started. Once more.
+            say(f"{name} is not up to date yet, trying it once more.")
         else:
             q["failed"].append(name)
             say(f"{name} is still not up to date, leaving it out.")
@@ -412,12 +444,16 @@ def work(q, todo):
         if is_printing():
             say("A print started, stopping before " + name + ".")
             break
+        # Saved before every item: if a reboot cuts in, the resume after
+        # the boot checks this item and carries on.
+        q["attempted"] = name
+        q.setdefault("attempts", {})[name] = q["attempts"].get(name, 0) + 1
+        save_queue(q)
         if reboots(name):
-            # Zmod reboots inside this upgrade call. Save first, then
-            # _UPDATE_ALL_RESUME picks the queue up after the boot.
-            q["attempted"] = name
-            save_queue(q)
-            say(f"Updating {name}. The printer reboots afterwards and "
+            # Zmod reboots inside this upgrade call (or the plugin's
+            # update.sh asks for one). _UPDATE_ALL_RESUME picks the queue
+            # up after the boot.
+            say(f"Updating {name}. The printer may reboot afterwards; "
                 "UPDATE_ALL carries on by itself.", complete=True)
             try:
                 request("POST", "/machine/update/upgrade", {"name": name},
@@ -456,6 +492,7 @@ def work(q, todo):
             q["need_reboot"] = True
             if name.lower() in WEB_DIRS:
                 inject_web()
+        q["attempted"] = None
         save_queue(q)
     finish(q, q["reboot"])
 

@@ -31,33 +31,53 @@ UPDATE_ALL: Done. Updated 4: fluidd, ff_nfc, moon, Z-Mod.
 
 ## The Update all button
 
-Mainsail's **UPDATE ALL COMPONENTS** and Fluidd's update-all button go
-through the same queue. The plugin's Moonraker component
-(`moonraker/zmod_update_all.py`) points Moonraker's full-update request
-(`machine.update.full`, and `machine.update.upgrade` without a name) at
-`update_all.py`. Stock Moonraker would run every updater in a row: it
-tries the OS packages, stops at the first repo with local changes, and is
-cut off when Zmod reboots after Z-Mod. With the plugin, the button skips
-System/OS packages and broken repos, updates plugins first, and resumes
-after each reboot, exactly like `UPDATE_ALL`. Progress shows in the update
+Zmod's Mainsail and Fluidd forks dropped their **UPDATE ALL COMPONENTS**
+button. This plugin puts it back, in Mainsail's Update Manager panel and
+next to **Check for updates** in Fluidd's Software Updates, and runs it
+through the same queue as `UPDATE_ALL`:
+
+![Mainsail Update Manager with the UPDATE ALL COMPONENTS button](docs/mainsail-update-all.png)
+
+![Fluidd Software Updates with the UPDATE ALL COMPONENTS button](docs/fluidd-update-all.png)
+
+The button shows how many updates the queue would install and hides when
+there are none. It skips System/OS packages and broken repos, updates
+plugins first, and resumes after each reboot. Progress shows in the update
 dialog and in the console.
 
-No Zmod file is changed. `install.sh` (run by `ENABLE_PLUGIN`) links the
-component into Moonraker's components, includes
-`zmod_update_all.moonraker.conf` from `mod_data/plugins.moonraker.conf` and
-reboots once. `DISABLE_PLUGIN` removes both, and the button is stock again.
+How it works, without changing any Zmod file:
+
+- `update_all.py --inject` adds `web/zmod_update_all.js` to Mainsail's and
+  Fluidd's `index.html` (and updates the page's revision in their service
+  worker, so browsers do not keep the old cached page). A Mainsail or
+  Fluidd update replaces those files, so the button is added again at
+  every boot and right after each Mainsail/Fluidd update.
+- The Moonraker component `moonraker/zmod_update_all.py` points
+  Moonraker's full-update request (`machine.update.full`, and
+  `machine.update.upgrade` without a name) at `update_all.py`. Stock
+  Moonraker would run every updater in a row: it tries the OS packages,
+  stops at the first repo with local changes, and is cut off when Zmod
+  reboots after Z-Mod.
+
+`install.sh` (run by `ENABLE_PLUGIN`) links the component into Moonraker's
+components, includes `zmod_update_all.moonraker.conf` from
+`mod_data/plugins.moonraker.conf`, adds the button and reboots once.
+`DISABLE_PLUGIN` removes all of it and restores the web UI files.
 
 ## How many reboots
 
 Zmod's Moonraker reboots the printer by itself straight after it updates
-**Z-Mod**, **klippy** (Klipper) or **moon** (Moonraker). Nothing can stop
-that, so each of those costs one reboot. Plugins and web UIs do not reboot.
+**Z-Mod**, **klippy** (Klipper) or **moon** (Moonraker). Some plugins ask
+for a reboot from their own `update.sh` too (for example `recommend`, when
+it applies new fixes). Nothing can stop those, so each can cost one
+reboot. Other plugins and the web UIs do not reboot.
 
 | Updates waiting | Reboots |
 |---|---|
 | plugins only | 1, at the end |
 | plugins + Z-Mod | 1 (the Z-Mod reboot also loads the plugins) |
 | plugins + klippy + moon + Z-Mod | 3 |
+| a rebooting plugin (recommend) + Z-Mod | up to 2 |
 
 You start it once; the reboots and the resume after each are automatic.
 
@@ -68,20 +88,25 @@ You start it once; the reboots and the resume after each are automatic.
 2. Asks Moonraker to check every update source (the same as **Refresh**).
 3. Updates the plugins and web UIs first, one at a time, through Moonraker's
    normal update path. Plugin `update.sh` scripts still run.
-4. Then klippy, moon and Z-Mod, in that order. Before each one it saves the
-   queue to `/root/.zmod_update_all.json` in the chroot. After the reboot,
-   `_UPDATE_ALL_RESUME` (a `delayed_gcode` at Klipper start) waits for
-   Moonraker and Klipper, checks the item really updated, and carries on.
-5. Skips items it cannot update safely (local changes, an invalid or corrupt
+4. Then the plugins whose `update.sh` can ask for a reboot (it writes
+   `REBOOT` to `/tmp/printer` or calls `reboot`), then klippy, moon and
+   Z-Mod, in that order, one at a time with a pause after each, so no
+   update starts while a reboot is on its way.
+5. The queue is saved to `/root/.zmod_update_all.json` in the chroot before
+   every item. After any reboot, `_UPDATE_ALL_RESUME` (a `delayed_gcode` at
+   Klipper start) waits for Moonraker and Klipper, checks the item really
+   updated, and carries on.
+6. Skips items it cannot update safely (local changes, an invalid or corrupt
    repo, a detached HEAD) and says why. Fix those from the update panel
    (Recover), then run `UPDATE_ALL` again.
-6. Keeps going if one item fails, and lists the failures at the end. An item
-   that is still out of date after its reboot is not tried again, so a bad
+7. Keeps going if one item fails, and lists the failures at the end. An item
+   that is still out of date after a reboot is tried once more (the reboot
+   may have come from something else); after that it is left out, so a bad
    update cannot cause a reboot loop.
-7. Stops if a print starts. After a reboot it waits until Moonraker's own
+8. Stops if a print starts. After a reboot it waits until Moonraker's own
    startup refresh is done before checking versions. A queue is resumed
    at most 6 times, then dropped.
-8. Reboots once with Zmod's `REBOOT` macro at the end, only if something was
+9. Reboots once with Zmod's `REBOOT` macro at the end, only if something was
    updated since the last reboot.
 
 The work runs in the background inside Zmod's chroot, so Klipper stays
