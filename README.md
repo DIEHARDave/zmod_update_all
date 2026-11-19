@@ -76,15 +76,23 @@ components, includes `zmod_update_all.moonraker.conf` from
 Zmod's Moonraker reboots the printer by itself straight after it updates
 **Z-Mod**, **klippy** (Klipper) or **moon** (Moonraker). Some plugins ask
 for a reboot from their own `update.sh` too (for example `recommend`, when
-it applies new fixes). Nothing can stop those, so each can cost one
-reboot. Other plugins and the web UIs do not reboot.
+it applies new fixes). While the queue updates such a plugin, its
+`update.sh` runs with that reboot held back: the request goes to a flag
+file instead of `/tmp/printer` (or instead of `reboot` / `systemctl
+reboot`), and the queue's own reboot at the end covers it. The script on
+disk is not changed, so the repo stays clean. A plugin you update by hand
+still reboots as before. Other plugins and the web UIs do not reboot.
 
 | Updates waiting | Reboots |
 |---|---|
 | plugins only | 1, at the end |
 | plugins + Z-Mod | 1 (the Z-Mod reboot also loads the plugins) |
 | plugins + klippy + moon + Z-Mod | 3 |
-| a rebooting plugin (recommend) + Z-Mod | up to 2 |
+| a rebooting plugin (recommend) + Z-Mod | 1 |
+
+Holding the plugin reboot back needs the Moonraker part of this plugin
+(loaded after the first Moonraker restart following install). Without it,
+those plugins go last, as in step 4 below, and can cost one reboot each.
 
 You start it once; the reboots and the resume after each are automatic.
 
@@ -94,9 +102,11 @@ You start it once; the reboots and the resume after each are automatic.
    updating something.
 2. Asks Moonraker to check every update source (the same as **Refresh**).
 3. Updates the plugins and web UIs first, one at a time, through Moonraker's
-   normal update path. Plugin `update.sh` scripts still run.
-4. Then the plugins whose `update.sh` can ask for a reboot (it writes
-   `REBOOT` to `/tmp/printer` or calls `reboot`), then klippy, moon and
+   normal update path. Plugin `update.sh` scripts still run, with any
+   reboot they ask for held back until the end of the queue.
+4. Then (only without the Moonraker part) the plugins whose `update.sh`
+   can ask for a reboot (it writes `REBOOT` to `/tmp/printer` or calls
+   `reboot`), then klippy, moon and
    Z-Mod, in that order, one at a time with a pause after each, so no
    update starts while a reboot is on its way.
 5. The queue is saved to `/root/.zmod_update_all.json` in the chroot before

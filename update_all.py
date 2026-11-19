@@ -6,7 +6,8 @@
 # the UPDATE_ALL macro. It forks into the background straight away so Klipper
 # is not blocked, and reports progress to the console through _UPDATE_ALL_MSG.
 #
-# Plugins are updated first, without a reboot. Zmod's Moonraker reboots the
+# Plugins are updated first, without a reboot (a plugin's update.sh that asks
+# for one gets it deferred to the end, see strip_reboots). Zmod's Moonraker reboots the
 # printer by itself right after updating Z-Mod, klippy or moon, so those go
 # last, one per boot: the queue is saved to disk before each of them and
 # _UPDATE_ALL_RESUME (a delayed_gcode at Klipper start) carries on after the
@@ -164,16 +165,107 @@ def plugin_reboots(name):
         return False
 
 
+# ---- deferred plugin reboots --------------------------------------------
+#
+# With the Moonraker component loaded, a plugin's update.sh runs with its
+# reboot request redirected into REBOOT_FLAG instead of /tmp/printer (or
+# instead of reboot/systemctl reboot). The queue then reboots once at its
+# end. Only for the plugin named in DEFER_PATH, which work() writes around
+# its own upgrade call, so a plugin updated by hand still reboots as usual.
+# The script on disk is never changed: the repo stays clean and the
+# plugin's current update.sh is what runs.
+DEFER_PATH = "/tmp/zmod_update_all.defer"
+REBOOT_FLAG = "/tmp/zmod_update_all.reboot"
+
+# A reboot in command position: at the start of a line or after ; && || |
+# ( or a then/do/else keyword. Not inside an echo "please reboot".
+_CMD = rb"(?:^|(?<=[;&|(])|(?<=\bthen)|(?<=\bdo)|(?<=\belse))[ \t]*"
+_STRIP = (
+    # echo "REBOOT" >/tmp/printer: Zmod reboots seconds later.
+    (re.compile(rb"""(echo[ \t]+["']?REBOOT["']?[ \t]*)>+[ \t]*/tmp/printer\b"""),
+     rb"\1>" + REBOOT_FLAG.encode()),
+    # sudo systemctl reboot, reboot, /sbin/reboot -f ...: only the command
+    # word is swapped, its arguments and redirections stay as they were.
+    (re.compile(rb"(" + _CMD + rb")(?:sudo[ \t]+)?(?:/usr)?(?:/s?bin/)?"
+                rb"(?:systemctl[ \t]+reboot|reboot)\b", re.M),
+     rb"\1_zua_reboot"),
+)
+_FUNC = b"_zua_reboot() { echo REBOOT >" + REBOOT_FLAG.encode() + b"; }\n"
+
+
+def strip_reboots(text):
+    """Return (script, changed): the script with every reboot it asks for
+    redirected into REBOOT_FLAG. Used by the Moonraker component."""
+    out = text
+    for rx, repl in _STRIP:
+        out = rx.sub(repl, out)
+    if out == text:
+        return text, False
+    if b"_zua_reboot" in out:
+        # Define the stand-in right after the shebang line.
+        if out.startswith(b"#!"):
+            head, _, rest = out.partition(b"\n")
+            out = head + b"\n" + _FUNC + rest
+        else:
+            out = _FUNC + out
+    return out, True
+
+
+def defer_wanted(name):
+    """For the component: is the queue updating this plugin right now?"""
+    try:
+        with open(DEFER_PATH) as f:
+            d = json.load(f)
+        with open(f"/proc/{int(d['pid'])}/cmdline", "rb") as f:
+            alive = b"update_all.py" in f.read()
+        return alive and d.get("name") == name
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+_DEFER = None
+
+
+def defer_ok():
+    """True when the Moonraker component defers plugin reboots."""
+    global _DEFER
+    if _DEFER is None:
+        try:
+            res = request("GET", "/server/zmod_update_all/info", timeout=10)
+            _DEFER = bool(res.get("defer_plugin_reboots"))
+        except Exception:
+            _DEFER = False
+    return _DEFER
+
+
+def set_defer(name):
+    for path in (REBOOT_FLAG, DEFER_PATH):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if name:
+        with open(DEFER_PATH, "w") as f:
+            json.dump({"name": name, "pid": os.getpid()}, f)
+
+
+def reboot_deferred():
+    """True when the last plugin's update.sh asked for a reboot."""
+    return os.path.exists(REBOOT_FLAG)
+
+
 def reboots(name):
     """True when updating this item may reboot the printer."""
-    return name.lower() in REBOOTS or plugin_reboots(name)
+    if name.lower() in REBOOTS:
+        return True
+    return plugin_reboots(name) and not defer_ok()
 
 
 def order_key(name):
     core = {n: i for i, n in enumerate(REBOOTS)}
     if name.lower() in core:
         return core[name.lower()]
-    return -1 if plugin_reboots(name) else -2
+    return -1 if reboots(name) else -2
 
 
 def plan(version_info, exclude=()):
@@ -480,6 +572,7 @@ def work(q, todo):
             save_queue(q)
             continue
         say(f"Updating {name}...")
+        set_defer(name)
         try:
             request("POST", "/machine/update/upgrade", {"name": name},
                     timeout=1800)
@@ -489,8 +582,13 @@ def work(q, todo):
         else:
             q["done"].append(name)
             q["need_reboot"] = True
+            if reboot_deferred():
+                say(f"{name} asked for a reboot, UPDATE_ALL reboots once "
+                    "at the end.")
             if name.lower() in WEB_DIRS:
                 inject_web()
+        finally:
+            set_defer(None)
         q["attempted"] = None
         save_queue(q)
     finish(q, q["reboot"])

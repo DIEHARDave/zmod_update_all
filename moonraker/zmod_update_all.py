@@ -24,10 +24,17 @@
 # It also adds POST /server/zmod_update_all/message, which update_all.py
 # uses to show its progress in the web UI's update dialog.
 #
+# Plugin reboots: while the queue updates a plugin, that plugin's update.sh
+# runs as a copy with its reboot request redirected to a flag file (see
+# update_all.strip_reboots), so the queue reboots once at its end. The
+# script on disk is untouched. GET /server/zmod_update_all/info tells
+# update_all.py whether this hook is in place.
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import os
 import subprocess
@@ -47,6 +54,7 @@ class ZmodUpdateAll:
         self.um: Any = None
         self.request_type: Any = None
         self.hooked = False
+        self.defer = False
 
     async def component_init(self) -> None:
         # Every component exists by now, update_manager's endpoints too.
@@ -77,11 +85,62 @@ class ZmodUpdateAll:
             updater = um.get_updaters().get(name)
             if updater is not None:
                 updater.update = self._wrap_web_update(updater.update)
+        self.defer = self._hook_plugin_scripts()
         self.server.register_endpoint(
             "/server/zmod_update_all/message", rtype.POST,
             self._handle_message)
+        self.server.register_endpoint(
+            "/server/zmod_update_all/info", rtype.GET, self._handle_info)
         logging.info("zmod_update_all: full update routed to update_all.py "
                      f"({', '.join(swapped) or 'upgrade only'})")
+
+    def _hook_plugin_scripts(self) -> bool:
+        """Zmod's GitDeploy.update() runs a plugin's update.sh right after
+        the pull with asyncio.create_subprocess_exec. Give git_deploy its
+        own asyncio stand-in whose create_subprocess_exec runs a copy of
+        that script with its reboot redirected (update_all.strip_reboots),
+        but only while the queue is updating that very plugin."""
+        mod = sys.modules.get(type(self.um).__module__.rsplit(".", 1)[0]
+                              + ".git_deploy")
+        real = getattr(mod, "asyncio", None)
+        if mod is None or real is not asyncio:
+            logging.info("zmod_update_all: git_deploy not as expected, "
+                         "plugin reboots are not deferred")
+            return False
+        mod.asyncio = _AsyncioProxy(real, self._plugin_exec)
+        return True
+
+    async def _plugin_exec(self, program: Any, *args: Any,
+                           **kwargs: Any) -> Any:
+        real = asyncio.create_subprocess_exec
+        path = str(program)
+        if args or not (path.endswith("/update.sh")
+                        and "/mod_data/plugins/" in path):
+            return await real(program, *args, **kwargs)
+        name = os.path.basename(os.path.dirname(path))
+        try:
+            ua = _load_update_all()
+            if not ua.defer_wanted(name):
+                return await real(program, *args, **kwargs)
+            with open(path, "rb") as f:
+                text = f.read()
+            new, changed = ua.strip_reboots(text)
+        except Exception as e:
+            logging.info(f"zmod_update_all: {name}: {e}, running update.sh "
+                         "unchanged")
+            return await real(program, *args, **kwargs)
+        if not changed:
+            return await real(program, *args, **kwargs)
+        interp = ["/bin/sh"]
+        first = text.split(b"\n", 1)[0]
+        if first.startswith(b"#!") and first[2:].split():
+            interp = [p.decode() for p in first[2:].split()]
+        logging.info(f"zmod_update_all: running {name}/update.sh with its "
+                     "reboot deferred to the end of the queue")
+        # sh -c SCRIPT PATH: $0 is the real path, so dirname "$0" still
+        # finds the plugin folder.
+        return await real(*interp, "-c", new.decode("utf-8", "replace"),
+                          path, **kwargs)
 
     def _wrap_web_update(self, orig: Any) -> Any:
         async def update(*args: Any, **kwargs: Any) -> Any:
@@ -128,6 +187,9 @@ class ZmodUpdateAll:
             raise self.server.error(f"Could not start UPDATE_ALL: {e}", 500)
         return "ok"
 
+    async def _handle_info(self, web_request: Any) -> dict:
+        return {"defer_plugin_reboots": self.defer}
+
     async def _handle_message(self, web_request: Any) -> str:
         msg = web_request.get_str("msg", "")
         complete = web_request.get_boolean("complete", False)
@@ -140,6 +202,27 @@ class ZmodUpdateAll:
             "application": "full",
             "proc_id": 0,
             "complete": complete})
+
+
+def _load_update_all() -> Any:
+    """update_all.py as a module, read fresh each time so a plugin update
+    takes effect without a Moonraker restart."""
+    spec = importlib.util.spec_from_file_location("zmod_update_all_script",
+                                                  SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _AsyncioProxy:
+    """asyncio for git_deploy alone, with one function replaced."""
+
+    def __init__(self, real: Any, exec_fn: Any) -> None:
+        self._real = real
+        self.create_subprocess_exec = exec_fn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
 
 
 def load_component(config: Any) -> ZmodUpdateAll:
