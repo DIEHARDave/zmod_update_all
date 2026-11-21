@@ -148,9 +148,20 @@ a short note of what you expected to happen.
 
 The report holds the plugin version, whether the Moonraker part is loaded,
 whether the button is in Mainsail and Fluidd, any saved queue, every update
-source with its versions, and the last 200 lines of the log. It has no
-system or network details, and logins or tokens in URLs and in the log are
-replaced with `***`. It is a plain text file, so you can read it before
+source with its versions, and the last 200 lines of the plugin's log. After
+that come the lines from the other logs an update touches, from this boot
+and the one before (a run can span a reboot):
+
+- the console (`mod_data/log/console.log`)
+- Moonraker (`logs/moonraker.log`), with the traceback of each error
+- Klipper (`logs/printer.log`), without its config dump
+- Zmod (`mod_data/log/zmod.log`)
+
+Only matching lines go in (errors, update steps, restarts, UPDATE_ALL
+messages), not whole logs, and a line that repeats is shown once with a
+count. Logins and tokens in URLs, webhook URLs and bot tokens are replaced
+with `***`. Log lines can still show the printer's hostname, local IP
+addresses or file names. It is a plain text file, so read it before
 sending it.
 
 Common answers:

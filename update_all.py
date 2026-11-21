@@ -610,8 +610,15 @@ _KEY_RE = re.compile(r"(?i)((?:api[_-]?key|token|password|passwd|secret)"
                      r"\W{0,3}[=:]\s*)\S+")
 
 
+# Discord/Slack webhook paths and Telegram bot tokens carry the secret in
+# the URL itself.
+_HOOK_RE = re.compile(r"(/api/webhooks/\d+/|hooks\.slack\.com/services/)\S+|"
+                      r"\bbot\d{6,}:[\w-]{20,}")
+
+
 def redact(text):
     text = _CRED_RE.sub(r"\1***@", text)
+    text = _HOOK_RE.sub(lambda m: (m.group(1) or "bot") + "***", text)
     return _KEY_RE.sub(r"\1***", text)
 
 
@@ -634,6 +641,150 @@ def _tail(path, n):
             return f.readlines()[-n:]
     except OSError as e:
         return [f"(cannot read {path}: {e})\n"]
+
+
+LOGS_DIR = "/root/printer_data/logs"
+MOD_LOG_DIR = "/root/printer_data/config/mod_data/log"
+_TS_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d")
+_ERR = r"error|exception|traceback|\bfail|!! |critical"
+# (title, file, older file pattern, bytes read from the end, line filter,
+#  lines dropped, skip config dump, follow multi-line entries)
+REPORT_LOGS = (
+    ("Console", os.path.join(MOD_LOG_DIR, "console.log"),
+     os.path.join(MOD_LOG_DIR, "console.1.log"), 512 * 1024,
+     re.compile(r"UPDATE_ALL|zmod_update_all|" + _ERR, re.I),
+     re.compile(r">> _UPDATE_ALL_MSG"), False, False),
+    ("Moonraker", os.path.join(LOGS_DIR, "moonraker.log"),
+     os.path.join(LOGS_DIR, "moonraker.log.*"), 3 * 1024 * 1024,
+     re.compile(r"Uncaught exception|traceback|error|exception|failed|"
+                r"Update script|Script output|Updating |Update Complete|"
+                r"upgrade|zmod_update_all\.py|\] - [45]\d\d |"
+                r"Exiting with signal|Starting Moonraker|Unable to|"
+                r"Server is busy", re.I),
+     re.compile(r"Failed to detect (current|upstream) version|"
+                r"successfully finished"), False, True),
+    ("Klipper", os.path.join(LOGS_DIR, "printer.log"),
+     os.path.join(LOGS_DIR, "printer.log.*"), 2 * 1024 * 1024,
+     re.compile(r"UPDATE_ALL|zmod_update_all|shell_command|Start printer|"
+                r"Restarting printer|Exiting|shutdown|" + _ERR, re.I),
+     None, True, True),
+    ("Zmod", os.path.join(MOD_LOG_DIR, "zmod.log"), None, 512 * 1024,
+     re.compile(r"zmod_update_all|" + _ERR + r"|ошибк|не удалось", re.I),
+     None, False, False),
+)
+# Entries kept per file: every one matching REPORT_LOG_KEY (update steps,
+# crashes) up to REPORT_LOG_MAX, then the newest of the rest.
+REPORT_LOG_MAX = 120
+REPORT_LOG_KEY = re.compile(r"UPDATE_ALL|zmod_update_all|Uncaught exception|"
+                            r"Traceback|Update script|Script output|"
+                            r"upgrade|Updating |\] - 5\d\d ", re.I)
+# A line's time stamp (Moonraker/Klipper, or the console's [hh:mm:ss.ms]),
+# left out when telling repeated lines apart.
+_STAMP_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d([,.]\d+)?|"
+                       r"\[\d\d:\d\d:\d\d(\.\d+)?\]) *")
+
+
+def _read_end(path, size):
+    """The last size bytes of a file as lines (first partial line dropped)."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        start = max(0, end - size)
+        f.seek(start)
+        data = f.read()
+    lines = data.decode("utf-8", "replace").splitlines()
+    return lines[1:] if start else lines
+
+
+def _filter_log(lines, keep, drop, skip_config, follow):
+    """Return (lines, entry count): matching lines, each with the untimed
+    lines after it (a traceback) when follow is set. A line seen before
+    (ignoring its time stamp) is not repeated: its first copy gets a count
+    and the time of the last one."""
+    entries = []   # [lines, repeats, last stamp]
+    seen = {}
+
+    def close(e):
+        key = _STAMP_RE.sub("", e[0][0], count=1)
+        first = seen.get(key)
+        if first is None:
+            seen[key] = e
+            entries.append(e)
+        else:
+            first[1] += 1
+            first[2] = e[2]
+
+    cur = None
+    in_config = False
+    for ln in lines:
+        if skip_config:
+            if ln.startswith("===== Config file"):
+                in_config = True
+                continue
+            if in_config:
+                if ln.startswith("======================="):
+                    in_config = False
+                continue
+        timed = _TS_RE.match(ln)
+        if cur is not None and not timed and len(cur[0]) < 30:
+            cur[0].append("    " + ln)
+            continue
+        if cur is not None:
+            close(cur)
+            cur = None
+        if keep.search(ln) and not (drop and drop.search(ln)):
+            m = _STAMP_RE.match(ln)
+            cur = [[ln], 0, m.group(0).strip() if m else ""]
+            if not follow:
+                close(cur)
+                cur = None
+    if cur is not None:
+        close(cur)
+    total = len(entries)
+    if total > REPORT_LOG_MAX:
+        key = [i for i, e in enumerate(entries)
+               if REPORT_LOG_KEY.search(e[0][0])][-REPORT_LOG_MAX:]
+        picked = set(key)
+        rest = [i for i in range(total) if i not in picked]
+        room = REPORT_LOG_MAX - len(key)
+        if room > 0:
+            picked.update(rest[-room:])
+        entries = [e for i, e in enumerate(entries) if i in picked]
+    out = []
+    for e in entries:
+        out.extend(e[0])
+        if e[1]:
+            out.append(f"    (repeated {e[1]} more time(s)"
+                       + (f", last at {e[2]})" if e[2] else ")"))
+    return out, total
+
+
+def _log_sections(add, section):
+    import glob
+    for title, path, older, size, keep, drop, skip_config, follow in REPORT_LOGS:
+        files = []
+        if older:
+            old = [p for p in glob.glob(older) if p != path]
+            if old:
+                # The run may have started before the last reboot.
+                files.append(max(old, key=os.path.getmtime))
+        files.append(path)
+        for p in files:
+            try:
+                stamp = time.strftime("%Y-%m-%d %H:%M",
+                                      time.localtime(os.path.getmtime(p)))
+                shown, total = _filter_log(_read_end(p, size), keep, drop,
+                                           skip_config, follow)
+            except OSError as e:
+                section(f"{title} log: {p}")
+                add(f"(cannot read: {e.strerror or e})")
+                continue
+            n = f"{total} different matching lines"
+            if total > REPORT_LOG_MAX:
+                n += f", {REPORT_LOG_MAX} shown (update steps and errors first)"
+            section(f"{title} log: {p} (changed {stamp}), {n}")
+            for ln in shown:
+                add(redact(ln))
 
 
 def _web_state(d):
@@ -782,8 +933,16 @@ def report():
     for ln in _tail(LOG_PATH, REPORT_LOG_LINES):
         add(redact(ln.rstrip("\n")))
 
+    # Lines from the other logs an update touches: errors, update steps,
+    # restarts. Only matching lines, not whole logs.
+    _log_sections(add, section)
+
     text = "\n".join(lines) + "\n"
     _write(REPORT_PATH, text)
+    try:
+        os.chmod(REPORT_PATH, 0o644)  # readable by the web UI's file list
+    except OSError:
+        pass
     print("Report saved to mod_data/log/zmod_update_all_report.txt in the "
           "config files. Download it there and send it in with a short "
           "note of what you expected.")
