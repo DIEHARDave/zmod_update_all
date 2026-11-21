@@ -649,27 +649,35 @@ _TS_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d")
 _ERR = r"error|exception|traceback|\bfail|!! |critical"
 # (title, file, older file pattern, bytes read from the end, line filter,
 #  lines dropped, skip config dump, follow multi-line entries)
+
+
+def _lc(pattern):
+    """A line filter run on the lowercased line: much faster on the
+    printer than re.IGNORECASE."""
+    return re.compile(pattern.lower())
+
+
 REPORT_LOGS = (
     ("Console", os.path.join(MOD_LOG_DIR, "console.log"),
      os.path.join(MOD_LOG_DIR, "console.1.log"), 512 * 1024,
-     re.compile(r"UPDATE_ALL|zmod_update_all|" + _ERR, re.I),
+     _lc(r"UPDATE_ALL|zmod_update_all|" + _ERR),
      re.compile(r">> _UPDATE_ALL_MSG"), False, False),
     ("Moonraker", os.path.join(LOGS_DIR, "moonraker.log"),
      os.path.join(LOGS_DIR, "moonraker.log.*"), 3 * 1024 * 1024,
-     re.compile(r"Uncaught exception|traceback|error|exception|failed|"
+     _lc(r"Uncaught exception|traceback|error|exception|failed|"
                 r"Update script|Script output|Updating |Update Complete|"
                 r"upgrade|zmod_update_all\.py|\] - [45]\d\d |"
                 r"Exiting with signal|Starting Moonraker|Unable to|"
-                r"Server is busy", re.I),
+                r"Server is busy"),
      re.compile(r"Failed to detect (current|upstream) version|"
                 r"successfully finished"), False, True),
     ("Klipper", os.path.join(LOGS_DIR, "printer.log"),
      os.path.join(LOGS_DIR, "printer.log.*"), 2 * 1024 * 1024,
-     re.compile(r"UPDATE_ALL|zmod_update_all|shell_command|Start printer|"
-                r"Restarting printer|Exiting|shutdown|" + _ERR, re.I),
+     _lc(r"UPDATE_ALL|zmod_update_all|shell_command|Start printer|"
+                r"Restarting printer|Exiting|shutdown|" + _ERR),
      None, True, True),
     ("Zmod", os.path.join(MOD_LOG_DIR, "zmod.log"), None, 512 * 1024,
-     re.compile(r"zmod_update_all|" + _ERR + r"|ошибк|не удалось", re.I),
+     _lc(r"zmod_update_all|" + _ERR + r"|ошибк|не удалось"),
      None, False, False),
 )
 # Entries kept per file: every one matching REPORT_LOG_KEY (update steps,
@@ -680,6 +688,11 @@ REPORT_LOG_KEY = re.compile(r"UPDATE_ALL|zmod_update_all|Uncaught exception|"
                             r"upgrade|Updating |\] - 5\d\d ", re.I)
 # A line's time stamp (Moonraker/Klipper, or the console's [hh:mm:ss.ms]),
 # left out when telling repeated lines apart.
+# Lines that continue an entry: indented (traceback frames, request
+# dumps), the traceback header, or the final "SomeError: ..." line.
+_CONT_RE = re.compile(r"\s|Traceback \(most recent call last\)|"
+                      r"HTTPServerRequest\(|"
+                      r"[\w.]*(Error|Exception|Exit|Interrupt|Warning)\b")
 _STAMP_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d([,.]\d+)?|"
                        r"\[\d\d:\d\d:\d\d(\.\d+)?\]) *")
 
@@ -726,15 +739,18 @@ def _filter_log(lines, keep, drop, skip_config, follow):
                     in_config = False
                 continue
         timed = _TS_RE.match(ln)
-        if cur is not None and not timed and len(cur[0]) < 30:
-            cur[0].append("    " + ln)
+        # Only what looks like a traceback belongs to the entry: Klipper's
+        # log has no time stamps, so "untimed" alone would swallow it.
+        if (cur is not None and not timed and len(cur[0]) < 30
+                and _CONT_RE.match(ln)):
+            cur[0].append("    " + ln[:500])
             continue
         if cur is not None:
             close(cur)
             cur = None
-        if keep.search(ln) and not (drop and drop.search(ln)):
+        if keep.search(ln[:600].lower()) and not (drop and drop.search(ln)):
             m = _STAMP_RE.match(ln)
-            cur = [[ln], 0, m.group(0).strip() if m else ""]
+            cur = [[ln[:500]], 0, m.group(0).strip() if m else ""]
             if not follow:
                 close(cur)
                 cur = None
@@ -759,6 +775,19 @@ def _filter_log(lines, keep, drop, skip_config, follow):
     return out, total
 
 
+def _rotation_age(path):
+    """Sort key, newest first, for rotated logs: printer.log.1 before .2,
+    moonraker.log.2026-11-19 before .2026-11-18. Not by file time: files
+    written before NTP synced are dated 2026-01-01."""
+    suffix = path.rsplit(".", 1)[-1]
+    if suffix.isdigit():
+        return (0, int(suffix))
+    m = re.search(r"(\d{4})-(\d\d)-(\d\d)(?:_(\d\d)-(\d\d)-(\d\d))?$", path)
+    if m:
+        return (1, -int("".join(g or "00" for g in m.groups())))
+    return (2, path)
+
+
 def _log_sections(add, section):
     import glob
     for title, path, older, size, keep, drop, skip_config, follow in REPORT_LOGS:
@@ -767,7 +796,7 @@ def _log_sections(add, section):
             old = [p for p in glob.glob(older) if p != path]
             if old:
                 # The run may have started before the last reboot.
-                files.append(max(old, key=os.path.getmtime))
+                files.append(min(old, key=_rotation_age))
         files.append(path)
         for p in files:
             try:
@@ -818,6 +847,90 @@ def _web_state(d):
     return ", ".join(parts)
 
 
+# Zmod's shell settings: which printer (AD5M=1, AD5X=1 or C5PRO=1) and the
+# file holding the full Z-Mod version. Newer Zmod first.
+ZMOD_SHELL = ("/usr/data/zmod/zmod/.shell/0.sh", "/opt/config/mod/.shell/0.sh")
+# Klipper sections the plugin needs; without the resume one a queue stops
+# at the first reboot.
+NEEDED_SECTIONS = ("gcode_macro UPDATE_ALL", "gcode_macro _UPDATE_ALL_MSG",
+                   "delayed_gcode _UPDATE_ALL_RESUME",
+                   "gcode_shell_command zmod_update_all",
+                   "gcode_shell_command zmod_update_all_resume")
+DISK_PATHS = (("plugins + config", "/root/printer_data/config"),
+              ("gcodes", "/root/printer_data/gcodes"),
+              ("chroot /", "/"), ("/tmp", "/tmp"))
+DISK_LOW = 100 * 1024 * 1024
+# Before NTP the clock starts at this time (local) at every boot.
+CLOCK_DEFAULT = time.mktime((2026, 1, 1, 0, 0, 0, 0, 0, -1))
+
+
+def _printer_model():
+    for path in ZMOD_SHELL:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read(4096)
+        except OSError:
+            continue
+        models = re.findall(r"^(AD5M|AD5X|C5PRO|[A-Z0-9]{3,6})=1\s*$",
+                            text, re.M)
+        ver = re.search(r'^VER_FULL="?([^"\n]+)', text, re.M)
+        version = ""
+        if ver:
+            try:
+                with open(ver.group(1)) as f:
+                    version = f.read().strip()
+            except OSError:
+                pass
+        model = ", ".join(models) or "unknown"
+        return model + (f", Z-Mod {version}" if version else "")
+    return "unknown (Zmod's 0.sh not found)"
+
+
+def _uptime():
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _span(sec):
+    sec = int(sec)
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m = sec // 60
+    return (f"{d}d " if d else "") + f"{h}h {m:02d}m"
+
+
+def _github_reachable():
+    """DNS + TCP connect to github.com:443 in a thread (getaddrinfo has no
+    timeout of its own)."""
+    import socket
+    import threading
+    res = {}
+
+    def probe():
+        try:
+            addr = socket.getaddrinfo("github.com", 443,
+                                      type=socket.SOCK_STREAM)[0][4]
+            res["dns"] = True
+            with socket.create_connection(addr[:2], timeout=5):
+                res["ok"] = True
+        except Exception as e:
+            res["err"] = f"{e.__class__.__name__}: {e}"
+
+    t = threading.Thread(target=probe, daemon=True)
+    t.start()
+    t.join(8)
+    if res.get("ok"):
+        return True, "github.com reachable"
+    if t.is_alive():
+        return False, "github.com: no answer within 8 s"
+    return False, ("github.com: " + ("DNS ok, connect failed: "
+                                     if res.get("dns") else "")
+                   + res.get("err", "?"))
+
+
 def report():
     """Write REPORT_PATH and print a short summary for the console."""
     lines = []
@@ -848,6 +961,45 @@ def report():
         for ln in status_lines.splitlines()[:20]:
             add("  " + ln)
     add(f"Python: {sys.version.split()[0]}")
+
+    section("System")
+    add(f"Printer: {_printer_model()}")
+    up = _uptime()
+    now = time.time()
+    if up is not None:
+        boot = now - up
+        add(f"Up for {_span(up)}, since "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot))}")
+        if boot < CLOCK_DEFAULT + 600:
+            add("Clock: NOT synced (still counting from 2026-01-01 since "
+                "boot; log times of this boot are off)")
+            notes.append("clock not synced (no network at boot?)")
+        else:
+            add("Clock: synced (times from before the sync in this boot's "
+                "logs read 2026-01-01)")
+    disks = {}   # one line per file system
+    for label, path in DISK_PATHS:
+        try:
+            sv = os.statvfs(path)
+            dev = os.stat(path).st_dev
+        except OSError as e:
+            add(f"Disk {label} ({path}): {e.strerror or e}")
+            continue
+        if dev in disks:
+            disks[dev][0].append(label)
+            continue
+        disks[dev] = ([label], path, sv)
+    for labels, path, sv in disks.values():
+        free = sv.f_bavail * sv.f_frsize
+        total = sv.f_blocks * sv.f_frsize
+        add(f"Disk {', '.join(labels)}: {free / 1048576:.0f} MB free of "
+            f"{total / 1048576:.0f} MB")
+        if total and free < DISK_LOW:
+            notes.append(f"low disk space ({', '.join(labels)})")
+    ok, msg = _github_reachable()
+    add(f"Network: {msg}")
+    if not ok:
+        notes.append("GitHub not reachable")
 
     section("Moonraker")
     info, err = ask("GET", "/server/info")
@@ -885,6 +1037,26 @@ def report():
     section("Printer")
     res, err = ask("GET", "/printer/objects/query", {"print_stats": "state"})
     add(f"Print state: {res['status']['print_stats']['state'] if res else err}")
+    # The whole config (some 300 KB) just for its section names: what
+    # Klipper actually loaded of the plugin's cfg.
+    try:
+        res = request("GET", "/printer/objects/query",
+                      {"configfile": "config"}, timeout=15)
+        sections = res["status"]["configfile"]["config"]
+    except Exception as e:
+        add(f"Klipper config: not available ({e})")
+    else:
+        missing = [s for s in NEEDED_SECTIONS if s not in sections]
+        if missing:
+            add("Klipper is MISSING: " + ", ".join(missing))
+            notes.append("Klipper did not load all of zmod_update_all.cfg "
+                         "(plugin not enabled, or no restart since?)")
+        else:
+            add("Klipper loaded UPDATE_ALL, _UPDATE_ALL_MSG, "
+                "_UPDATE_ALL_RESUME and both shell commands")
+        sc = sections.get("gcode_shell_command zmod_update_all", {})
+        if sc.get("command"):
+            add(f"Shell command: {sc['command']}")
 
     section("Web UI button")
     for name, d in WEB_DIRS.items():
@@ -926,6 +1098,18 @@ def report():
                 + (f", {behind} behind" if behind else "")
                 + (f", channel {i['channel']}" if i.get("channel") else "")
                 + (f" [{'; '.join(flags)}]" if flags else ""))
+            if i.get("configured_type") == "git_repo" and i.get("remote_url"):
+                add(f"    {i.get('remote_alias') or 'origin'} "
+                    f"{redact(str(i['remote_url']))}, branch "
+                    f"{i.get('branch')}")
+            # Why Moonraker thinks a repo is invalid/dirty, and what git
+            # said on the last failed command.
+            for key in ("warnings", "anomalies"):
+                for w in (i.get(key) or [])[:5]:
+                    add(f"    {'warning' if key == 'warnings' else 'anomaly'}: "
+                        f"{redact(str(w))[:300]}")
+            for m in (i.get("git_messages") or [])[-5:]:
+                add(f"    git: {redact(str(m))[:300]}")
         notes.append(f"{pending} update(s) pending" if pending else
                      "no updates pending (the button hides itself then)")
 

@@ -143,12 +143,26 @@ UPDATE_ALL REPORT=1
 It saves `mod_data/log/zmod_update_all_report.txt` in the config files
 (Mainsail: Machine, Fluidd: Configuration; open `mod_data`, then `log`).
 Download that file and attach it to a
-[GitHub issue](https://github.com/DIEHARDave/zmod_update_all/issues), with
-a short note of what you expected to happen.
+[GitHub issue](https://github.com/DIEHARDave/zmod_update_all/issues).
+Run it soon after the problem: it reads the current and the previous log
+of each kind, so a run from days ago may be gone. In the issue, also say:
 
-The report holds the plugin version, whether the Moonraker part is loaded,
+- what you did and roughly when ("pressed Update all in Fluidd at 3:20 pm"),
+  so the times can be matched to the logs
+- what you expected and what happened instead
+- whether you rebooted or switched the printer off during the run
+- for button problems: Mainsail or Fluidd, which browser, and a screenshot
+  (what happens in the browser never reaches the printer's logs)
+
+The report holds the plugin version, the printer model and Z-Mod version,
+uptime and whether the clock has synced (the printer starts at 2026-01-01
+until it has network), free disk space, whether GitHub can be reached,
+whether the Moonraker part is loaded, whether Klipper loaded the plugin's
+macros (without `_UPDATE_ALL_RESUME` a queue stops at the first reboot),
 whether the button is in Mainsail and Fluidd, any saved queue, every update
-source with its versions, and the last 200 lines of the plugin's log. After
+source with its versions, remote, branch and the warnings Moonraker gives
+for it (why a repo counts as invalid or dirty), and the last 200 lines of
+the plugin's log. After
 that come the lines from the other logs an update touches, from this boot
 and the one before (a run can span a reboot):
 
