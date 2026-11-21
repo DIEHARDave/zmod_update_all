@@ -142,6 +142,35 @@ def has_update(info):
     return info.get("version") != remote
 
 
+_VER_RE = re.compile(r"^v?(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?$")
+
+
+def _ver_key(text):
+    """Semver-style sort key, or None when the text is not a version.
+    A release sorts above its pre-releases (1.1.0 > 1.1.0-rc.4)."""
+    m = _VER_RE.match(str(text or "").strip())
+    if not m:
+        return None
+    nums = [int(x) for x in m.group(1).split(".")]
+    nums += [0] * (4 - len(nums))
+    if not m.group(2):
+        return (tuple(nums), 1, ())
+    pre = tuple((0, int(p), "") if p.isdigit() else (1, 0, p)
+                for p in m.group(2).split("."))
+    return (tuple(nums), 0, pre)
+
+
+def downgrade(info):
+    """True when a web item's offered version is older than the installed
+    one. Moonraker picks the newest release by date, so a fix release on
+    an older line (helixscreen v1.0.11 after v1.1.0-rc.4) shows up as an
+    "update". Git repos count commits behind, so they never go back."""
+    if info.get("configured_type") != "web":
+        return False
+    have, offer = _ver_key(info.get("version")), _ver_key(info.get("remote_version"))
+    return bool(have and offer and offer < have)
+
+
 def problem(info):
     for key, bad, reason in PROBLEMS:
         if key in info and info[key] == bad:
@@ -277,6 +306,8 @@ def plan(version_info, exclude=()):
         if name in exclude or not has_update(info):
             continue
         reason = problem(info)
+        if not reason and downgrade(info):
+            reason = "would downgrade, the installed version is newer"
         if reason:
             skipped.append((name, reason))
         else:
@@ -1087,6 +1118,8 @@ def report():
                      if key in i and i[key] == bad]
             if name.lower() in SKIP:
                 flags.append("not handled by UPDATE_ALL")
+            elif has_update(i) and downgrade(i):
+                flags.append("would downgrade, skipped")
             elif has_update(i):
                 pending += 1
                 flags.append("UPDATE")

@@ -25,6 +25,40 @@
     })
   }
 
+  // update_all.py's _ver_key: [numbers, release?, pre-release parts], or null.
+  function verKey(text) {
+    var m = /^v?(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?$/.exec(String(text || '').trim())
+    if (!m) return null
+    var nums = m[1].split('.').map(Number)
+    while (nums.length < 4) nums.push(0)
+    return [nums, m[2] ? 0 : 1, m[2] ? m[2].split('.') : []]
+  }
+
+  function cmpPre(a, b) {
+    for (var k = 0; k < Math.min(a.length, b.length); k++) {
+      var an = /^\d+$/.test(a[k]), bn = /^\d+$/.test(b[k])
+      if (an && bn && +a[k] !== +b[k]) return +a[k] - +b[k]
+      if (an !== bn) return an ? -1 : 1
+      if (!an && a[k] !== b[k]) return a[k] < b[k] ? -1 : 1
+    }
+    return a.length - b.length
+  }
+
+  function cmpVer(a, b) {
+    for (var k = 0; k < Math.max(a[0].length, b[0].length); k++) {
+      var d = (a[0][k] || 0) - (b[0][k] || 0)
+      if (d) return d
+    }
+    return a[1] !== b[1] ? a[1] - b[1] : cmpPre(a[2], b[2])
+  }
+
+  // A web item offering an older version (Moonraker picks by date).
+  function downgrade(i) {
+    if (i.configured_type !== 'web') return false
+    var have = verKey(i.version), offer = verKey(i.remote_version)
+    return !!(have && offer && cmpVer(offer, have) < 0)
+  }
+
   // Same rule as update_all.py: what the queue would install.
   function countUpdates(info) {
     var n = 0
@@ -32,7 +66,7 @@
       var i = info[name]
       if (SKIP.indexOf(name.toLowerCase()) >= 0 || !i.configured_type) return
       if (i.is_valid === false || i.is_dirty || i.corrupt || i.detached ||
-          i.channel_invalid) return
+          i.channel_invalid || downgrade(i)) return
       var behind = i.configured_type === 'git_repo' && i.commits_behind_count > 0
       var remote = i.remote_version
       if (behind || (remote && remote !== '?' && i.version !== remote)) n++

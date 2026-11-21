@@ -116,7 +116,12 @@ You start it once; the reboots and the resume after each are automatic.
    updated, and carries on.
 6. Skips items it cannot update safely (local changes, an invalid or corrupt
    repo, a detached HEAD) and says why. Fix those from the update panel
-   (Recover), then run `UPDATE_ALL` again.
+   (Recover), then run `UPDATE_ALL` again. It also skips a web UI or screen
+   whose offered version is older than the installed one: Moonraker offers
+   the newest release by date, so a fix release on an older line (for
+   example HelixScreen v1.0.11 after v1.1.0-rc.4) shows up as an update.
+   The button does not count those either. Install a downgrade by hand from
+   the update panel if you really want it.
 7. Keeps going if one item fails, and lists the failures at the end. An item
    that is still out of date after a reboot is tried once more (the reboot
    may have come from something else); after that it is left out, so a bad
