@@ -16,6 +16,7 @@ UPDATE_ALL            check, install every update, reboot when needed
 UPDATE_ALL CHECK=1    only list the available updates
 UPDATE_ALL REBOOT=0   plugins only, reboot yourself later
 UPDATE_ALL CANCEL=1   drop a queue that is waiting for a reboot
+UPDATE_ALL REPORT=1   write a support report (see Reporting a problem)
 ```
 
 Progress appears in the console (Fluidd, Mainsail, HelixScreen):
@@ -129,6 +130,38 @@ You start it once; the reboots and the resume after each are automatic.
 The work runs in the background inside Zmod's chroot, so Klipper stays
 responsive. Full log: `mod_data/log/zmod_update_all.log` in the printer's config
 folder (Fluidd/Mainsail show it), kept across the reboots.
+
+## Reporting a problem
+
+If the updater or the button does not do what you expected, run this in
+the console:
+
+```
+UPDATE_ALL REPORT=1
+```
+
+It saves `mod_data/log/zmod_update_all_report.txt` in the config files
+(Mainsail: Machine, Fluidd: Configuration; open `mod_data`, then `log`).
+Download that file and attach it to a
+[GitHub issue](https://github.com/DIEHARDave/zmod_update_all/issues), with
+a short note of what you expected to happen.
+
+The report holds the plugin version, whether the Moonraker part is loaded,
+whether the button is in Mainsail and Fluidd, any saved queue, every update
+source with its versions, and the last 200 lines of the log. It has no
+system or network details, and logins or tokens in URLs and in the log are
+replaced with `***`. It is a plain text file, so you can read it before
+sending it.
+
+Common answers:
+
+- **No button**: it hides itself when there is nothing to update. After
+  installing or updating the plugin, it appears after the next reboot. If
+  it still does not show, reload the page with Ctrl+Shift+R (the browser
+  may keep the old cached page).
+- **`ld.so: object ... libts.so ... cannot be preloaded`**: older versions
+  printed this harmless warning in the console as an ERROR line. v0.3.1 and
+  later no longer show it.
 
 ## Install
 

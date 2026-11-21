@@ -594,6 +594,203 @@ def work(q, todo):
     finish(q, q["reboot"])
 
 
+# ---- the support report -------------------------------------------------
+#
+# UPDATE_ALL REPORT=1: one text file with everything needed to see why a run
+# did not do what was expected, saved next to the log so it can be
+# downloaded from the web UI's config files. Only selected fields go in (no
+# raw Moonraker dumps, no system info), and logins in URLs are blanked.
+
+REPORT_PATH = "/root/printer_data/config/mod_data/log/zmod_update_all_report.txt"
+REPORT_LOG_LINES = 200
+PLUGINS_CONF = "/root/printer_data/config/mod_data/plugins.moonraker.conf"
+
+_CRED_RE = re.compile(r"(\w+://)[^/@\s]+@")
+_KEY_RE = re.compile(r"(?i)((?:api[_-]?key|token|password|passwd|secret)"
+                     r"\W{0,3}[=:]\s*)\S+")
+
+
+def redact(text):
+    text = _CRED_RE.sub(r"\1***@", text)
+    return _KEY_RE.sub(r"\1***", text)
+
+
+def _git(*args):
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", PLUGIN_DIR] + list(args),
+                             capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        return f"(git failed: {e})"
+    if out.returncode:
+        err = (out.stderr.strip().splitlines() or ["?"])[0]
+        return f"(git failed: {err})"
+    return out.stdout.strip()
+
+
+def _tail(path, n):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.readlines()[-n:]
+    except OSError as e:
+        return [f"(cannot read {path}: {e})\n"]
+
+
+def _web_state(d):
+    """Is the button script in this web UI, and does the PWA know?"""
+    index = os.path.join(d, "index.html")
+    try:
+        with open(index, encoding="utf-8", newline="") as f:
+            html = f.read()
+    except OSError:
+        return "not installed"
+    parts = ["button in index.html" if WEB_MARK in html
+             else "button NOT in index.html"]
+    try:
+        with open(os.path.join(d, "zmod_update_all.js"), "rb") as f,                 open(WEB_JS, "rb") as g:
+            same = f.read() == g.read()
+        parts.append("script current" if same else "script OUTDATED")
+    except OSError:
+        parts.append("script MISSING")
+    try:
+        with open(os.path.join(d, "sw.js"), encoding="utf-8") as f:
+            sw = f.read()
+        rev = hashlib.md5(html.encode()).hexdigest()
+        if "index.html" not in sw:
+            parts.append("sw.js has no index.html entry")
+        else:
+            parts.append("sw.js revision matches" if rev in sw
+                         else "sw.js revision STALE (browser may show the "
+                              "old page)")
+    except OSError:
+        parts.append("no sw.js")
+    return ", ".join(parts)
+
+
+def report():
+    """Write REPORT_PATH and print a short summary for the console."""
+    lines = []
+    notes = []
+
+    def add(text=""):
+        lines.append(text)
+
+    def section(title):
+        add()
+        add(f"== {title} ==")
+
+    def ask(method, path, query=None):
+        try:
+            return request(method, path, query, timeout=5), None
+        except Exception as e:
+            return None, str(e) or e.__class__.__name__
+
+    add("zmod_update_all support report")
+    add(f"Written: {time.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+        "(the printer clock reads 2026-01-01 until NTP has synced)")
+    add(f"Plugin: {_git('describe', '--tags', '--always', '--dirty')}"
+        f" on branch {_git('rev-parse', '--abbrev-ref', 'HEAD')}")
+    add(f"Last commit: {_git('log', '-1', '--format=%h %ci %s')}")
+    status_lines = _git("status", "--porcelain")
+    if status_lines and not status_lines.startswith("("):
+        add("Local changes in the plugin folder:")
+        for ln in status_lines.splitlines()[:20]:
+            add("  " + ln)
+    add(f"Python: {sys.version.split()[0]}")
+
+    section("Moonraker")
+    info, err = ask("GET", "/server/info")
+    if err:
+        add(f"Not reachable: {err}")
+        notes.append("Moonraker not reachable")
+    else:
+        add(f"Version: {info.get('moonraker_version')}, "
+            f"Klippy: {info.get('klippy_state')}")
+        comps = info.get("components") or []
+        failed = info.get("failed_components") or []
+        loaded = "zmod_update_all" in comps
+        add(f"zmod_update_all component: "
+            f"{'loaded' if loaded else 'NOT loaded'}"
+            f"{' (FAILED to load)' if 'zmod_update_all' in failed else ''}")
+        if failed:
+            add(f"Failed components: {', '.join(failed)}")
+        for w in (info.get("warnings") or [])[:20]:
+            add(f"Warning: {redact(str(w))}")
+        if not loaded:
+            notes.append("Moonraker component not loaded (reboot after "
+                         "install or update?)")
+        cinfo, err = ask("GET", "/server/zmod_update_all/info")
+        add(f"Component info: {cinfo if cinfo is not None else err}")
+    try:
+        with open(PLUGINS_CONF, encoding="utf-8") as f:
+            inc = "zmod_update_all.moonraker.conf" in f.read()
+    except OSError:
+        inc = False
+    add(f"Include in mod_data/plugins.moonraker.conf: "
+        f"{'yes' if inc else 'NO'}")
+    if not inc:
+        notes.append("Moonraker include missing (run ENABLE_PLUGIN again)")
+
+    section("Printer")
+    res, err = ask("GET", "/printer/objects/query", {"print_stats": "state"})
+    add(f"Print state: {res['status']['print_stats']['state'] if res else err}")
+
+    section("Web UI button")
+    for name, d in WEB_DIRS.items():
+        state = _web_state(d)
+        add(f"{name}: {state}")
+        if "NOT" in state or "MISSING" in state:
+            notes.append(f"button missing in {name}")
+
+    section("Queue")
+    q = load_queue()
+    add(f"Saved queue: {json.dumps(q) if q else 'none'}")
+    add(f"Running now: {'yes' if already_running() else 'no'}")
+    for path in (DEFER_PATH, REBOOT_FLAG):
+        if os.path.exists(path):
+            add(f"{path} exists")
+
+    section("Updates (as Moonraker last saw them)")
+    st, err = ask("GET", "/machine/update/status")
+    if err:
+        add(f"Not available: {err}")
+    else:
+        add(f"Moonraker busy: {st.get('busy')}")
+        pending = 0
+        for name, i in sorted((st.get("version_info") or {}).items()):
+            if not isinstance(i, dict):
+                continue
+            flags = [reason for key, bad, reason in PROBLEMS
+                     if key in i and i[key] == bad]
+            if name.lower() in SKIP:
+                flags.append("not handled by UPDATE_ALL")
+            elif has_update(i):
+                pending += 1
+                flags.append("UPDATE")
+                if plugin_reboots(name):
+                    flags.append("update.sh reboots")
+            behind = i.get("commits_behind_count")
+            add(f"{name}: {i.get('configured_type')} "
+                f"{i.get('version')} -> {i.get('remote_version')}"
+                + (f", {behind} behind" if behind else "")
+                + (f", channel {i['channel']}" if i.get("channel") else "")
+                + (f" [{'; '.join(flags)}]" if flags else ""))
+        notes.append(f"{pending} update(s) pending" if pending else
+                     "no updates pending (the button hides itself then)")
+
+    section(f"Last {REPORT_LOG_LINES} log lines ({LOG_PATH})")
+    for ln in _tail(LOG_PATH, REPORT_LOG_LINES):
+        add(redact(ln.rstrip("\n")))
+
+    text = "\n".join(lines) + "\n"
+    _write(REPORT_PATH, text)
+    print("Report saved to mod_data/log/zmod_update_all_report.txt in the "
+          "config files. Download it there and send it in with a short "
+          "note of what you expected.")
+    if notes:
+        print("Summary: " + "; ".join(notes) + ".")
+
+
 # ---- process handling ---------------------------------------------------
 
 def already_running():
@@ -640,6 +837,8 @@ def main():
                         help="add the Update all button to Mainsail/Fluidd")
     parser.add_argument("--uninject", action="store_true",
                         help="remove the Update all button again")
+    parser.add_argument("--report", action="store_true",
+                        help="write a support report next to the log")
     parser.add_argument("--foreground", action="store_true",
                         help="run in this process (for testing over SSH)")
     args = parser.parse_args()
@@ -648,6 +847,9 @@ def main():
         had = load_queue() is not None
         drop_queue()
         print("UPDATE_ALL queue dropped." if had else "No queue to drop.")
+        return
+    if args.report:
+        report()
         return
     if args.inject or args.uninject:
         inject_web(remove=args.uninject)
